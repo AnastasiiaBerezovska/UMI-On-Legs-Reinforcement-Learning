@@ -6,7 +6,8 @@ class Parkour(BaseEnv):
     def __init__(self, config, device, *args, **kwargs):
         super().__init__(config=config, device=device, *args, **kwargs)
         
-        obs_size = self.config.steering_params.obs_size  # Assuming this is 4 (2 directions * 2D each)
+        # Set observation size explicitly - 4 values (2 normalized direction vectors of 2D each)
+        obs_size = 4
         self.parkour_obs = torch.zeros((self.num_envs, obs_size), device=self.device)
         
         self.start_pos = torch.zeros((self.num_envs, 3), device=self.device)
@@ -26,10 +27,15 @@ class Parkour(BaseEnv):
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
         
-        # Call parent reset first - this should handle robot pose initialization
+        # Call parent reset first - this should handle robot pose initialization  
         obs = super().reset(env_ids)
         
         if len(env_ids) > 0:
+            # Ensure env_ids are valid
+            env_ids = env_ids[env_ids < self.num_envs]
+            if len(env_ids) == 0:
+                return obs
+                
             # Get the current root state after parent reset
             root_states = self.simulator.get_root_state(env_ids)
             self.start_pos[env_ids] = root_states.root_pos
@@ -47,36 +53,48 @@ class Parkour(BaseEnv):
         
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
-            root_states = self.simulator.get_root_state()
-        else:
-            root_states = self.simulator.get_root_state(env_ids)
         
-        # Compute parkour-specific observations
-        obs = compute_parkour_observations(
-            root_states.root_pos, 
-            self.goal_1[env_ids], 
-            self.goal_2[env_ids]
-        )
+        # Ensure env_ids are valid and within bounds
+        env_ids = env_ids[env_ids < self.num_envs]
+        if len(env_ids) == 0:
+            return
+        
+        # Get root states for the specified environments
+        root_states = self.simulator.get_root_state(env_ids)
+        root_pos = root_states.root_pos
+        
+        # Compute directions to goals (no JIT for now)
+        dir1_xy = (self.goal_1[env_ids] - root_pos)[..., :2]
+        dir2_xy = (self.goal_2[env_ids] - root_pos)[..., :2]
+        
+        # Normalize directions
+        dir1_norm = dir1_xy / (torch.norm(dir1_xy, dim=-1, keepdim=True) + 1e-8)
+        dir2_norm = dir2_xy / (torch.norm(dir2_xy, dim=-1, keepdim=True) + 1e-8)
+        
+        obs = torch.cat([dir1_norm, dir2_norm], dim=-1)
         self.parkour_obs[env_ids] = obs
 
     def compute_reward(self):
         root_pos = self.simulator.get_root_state().root_pos
         
-        # Use JIT-compiled reward function for efficiency (following Steering pattern)
-        self.rew_buf[:] = compute_parkour_reward(
-            root_pos, 
-            self._prev_root_pos,
-            self.goal_1, 
-            self.goal_2,
-            self.goal_tolerance
-        )
+        # Simplified reward without JIT for now
+        dist1 = torch.norm(self.goal_1 - root_pos, dim=-1)
+        dist2 = torch.norm(self.goal_2 - root_pos, dim=-1)
+        closer_dist = torch.min(dist1, dist2)
         
-        # Add contact penalty (following Steering pattern)
-        contact_forces = self.simulator.get_bodies_contact_buf()
-        # Penalize head/torso contact - you may need to adjust these indices for T1 Booster
-        if hasattr(self, 'penalize_contact_indices'):
-            contact_penalty = (contact_forces[:, self.penalize_contact_indices].sum(dim=-1) > 0.1).sum(dim=-1).float()
-            self.rew_buf[:] -= contact_penalty * 0.2
+        # Progress reward
+        prev_dist1 = torch.norm(self.goal_1 - self._prev_root_pos, dim=-1)
+        prev_dist2 = torch.norm(self.goal_2 - self._prev_root_pos, dim=-1)
+        prev_closer_dist = torch.min(prev_dist1, prev_dist2)
+        progress = prev_closer_dist - closer_dist
+        
+        # Simple reward components
+        distance_reward = torch.exp(-closer_dist)
+        goal_bonus = (closer_dist < self.goal_tolerance).float() * 5.0
+        upright_reward = (root_pos[..., 2] > 0.5).float() * 0.1
+        fall_penalty = (root_pos[..., 2] < 0.3).float() * -10.0
+        
+        self.rew_buf[:] = distance_reward + progress * 2.0 + goal_bonus + upright_reward + fall_penalty
         
         # Store current position for next step
         self._prev_root_pos[:] = root_pos
