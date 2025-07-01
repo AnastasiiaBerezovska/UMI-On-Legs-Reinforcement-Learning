@@ -1,5 +1,11 @@
 1ba6f9b32f9dc038b551fdba824abae0c561f4c4
 
+https://arxiv.org/pdf/2506.15132v1
+
+https://arxiv.org/html/2506.15132v1
+
+
+
 import torch
 from torch import Tensor
 from protomotions.envs.base_env.env import BaseEnv
