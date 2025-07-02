@@ -8,7 +8,12 @@ https://arxiv.org/html/2506.15132v1
 
 import torch
 from torch import Tensor
+from isaac_utils import rotations, torch_utils
+
 from protomotions.envs.base_env.env import BaseEnv
+from protomotions.envs.base_env.env_utils.humanoid_utils import (
+    compute_humanoid_reset,
+)
 
 class Parkour(BaseEnv):
     def __init__(self, config, device: torch.device, *args, **kwargs):
@@ -21,17 +26,17 @@ class Parkour(BaseEnv):
             dtype=torch.float,
         )
 
-        # Track starting position
-        self._start_pos = torch.zeros([self.num_envs, 3], device=self.device, dtype=torch.float)
+        # Hard-coded goal position
+        self.goal_pos = torch.zeros((self.num_envs, 3), device=device, dtype=torch.float)
 
     def reset(self, env_ids=None):
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
         
         obs = super().reset(env_ids)
-        
-        # Remember where we started
-        self._start_pos[env_ids] = self.simulator.get_root_state(env_ids).root_pos
+        root_states = self.simulator.get_root_state(env_ids)
+        self.goal_pos[env_ids, :] = root_states.root_pos.clone()
+        self.goal_pos[env_ids, 0] += 2
         
         return obs
 
@@ -64,24 +69,13 @@ class Parkour(BaseEnv):
     def compute_observations(self, env_ids=None):
         super().compute_observations(env_ids)
 
-        if env_ids is None:
-            root_pos = self.simulator.get_root_state().root_pos
-            start_pos = self._start_pos
-        else:
-            root_pos = self.simulator.get_root_state(env_ids).root_pos
-            start_pos = self._start_pos[env_ids]
-
-        # Simple observation: how far forward we've moved
-        forward_progress = (root_pos - start_pos)[..., 0]  # x-direction
-        goal_distance = 2.0 - forward_progress  # distance left to go
+        # transform goal to the robot frame
+        root_states = self.simulator.get_root_state(env_ids)
+        goal_pos_robot = rotations.quat_rotate_inverse(
+            root_states.root_rot, (self.goal_pos - root_states.root_pos), w_last=True)
         
-        # 4 observations: [progress, distance_left, 0, 0]
-        obs = torch.stack([
-            forward_progress,
-            goal_distance,
-            torch.zeros_like(forward_progress),
-            torch.zeros_like(forward_progress)
-        ], dim=-1)
+        # 2 goal x-y coordinate in robot frame
+        obs = goal_pos_robot[:, :2]
 
         self.parkour_obs[env_ids] = obs
 
@@ -93,22 +87,4 @@ class Parkour(BaseEnv):
     def compute_reward(self):
         root_pos = self.simulator.get_root_state().root_pos
         
-        # How far forward from start
-        forward_progress = (root_pos - self._start_pos)[..., 0]
-        
-        # Simple reward: closer to 2 meters = better
-        self.rew_buf[:] = 2.0 - torch.abs(2.0 - forward_progress)
-        
-        # Success bonus
-        reached_goal = forward_progress >= 2.0
-        self.rew_buf[:] += reached_goal.float() * 10.0
-
-    def is_done(self):
-        root_pos = self.simulator.get_root_state().root_pos
-        forward_progress = (root_pos - self._start_pos)[..., 0]
-        
-        # Done when: reached 2m goal OR fell down
-        success = forward_progress >= 2.0
-        fallen = root_pos[..., 2] < 0.3
-        
-        return success | fallen
+        self.rew_buf[:] = torch.exp(-torch.norm((self.goal_pos - root_pos)[:, :2], dim=-1) / 2.0)
