@@ -35,6 +35,32 @@ class Parkour(BaseEnv):
         
         return obs
 
+    def compute_reset(self):
+        bodies_positions = self.simulator.get_bodies_state().rigid_body_pos
+        bodies_contact_buf = self.self_obs_cb.body_contacts.clone()
+
+        self.reset_buf[:], self.terminate_buf[:] = compute_humanoid_reset(
+            self.reset_buf,
+            self.progress_buf,
+            bodies_contact_buf,
+            self.non_termination_contact_body_ids,
+            bodies_positions,
+            self.config.max_episode_length,
+            self.config.enable_height_termination,
+            self.termination_heights
+            + self.terrain.get_ground_heights(bodies_positions[:, 0]),
+        )
+
+        body_height = bodies_positions[:, 0, 2]
+        self.terminate_buf[:] = torch.logical_or(
+            self.terminate_buf[:],
+            body_height < 0.45
+        )
+        self.reset_buf[:] = torch.logical_or(
+            self.reset_buf,
+            self.terminate_buf
+        )
+
     def compute_observations(self, env_ids=None):
         super().compute_observations(env_ids)
 
