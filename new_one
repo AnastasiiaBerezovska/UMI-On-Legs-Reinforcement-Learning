@@ -1,0 +1,137 @@
+import torch
+from torch import Tensor
+from isaac_utils import rotations, torch_utils
+from protomotions.envs.base_env.env import BaseEnv
+from protomotions.envs.base_env.env_utils.humanoid_utils import (
+    compute_humanoid_reset,
+)
+import numpy as np
+
+class Parkour(BaseEnv):
+    def __init__(self, config, device: torch.device, *args, **kwargs):
+        super().__init__(config=config, device=device, *args, **kwargs)
+        # Same as steering
+        self.parkour_obs = torch.zeros(
+            (self.config.num_envs, self.config.steering_params.obs_size),
+            device=device,
+            dtype=torch.float,
+        )
+        # Hard-coded goal position
+        self.goal_pos = torch.zeros((self.num_envs, 3), device=device, dtype=torch.float)
+        
+        # Platform parameters
+        self.platform_height = 0.5
+        self.platform_size = [2.0, 2.0, 0.5]  # length, width, height
+        self.platform_pos = [1.5, 0.0, self.platform_height/2]  # x, y, z
+        
+        # Create platforms after environment is set up
+        self._create_platforms()
+    
+    def _create_platforms(self):
+        """Create platform actors in Isaac Gym"""
+        # Access the gym and sim from simulator
+        gym = self.simulator.gym
+        sim = self.simulator.sim
+        
+        # Create platform asset
+        asset_options = gymapi.AssetOptions()
+        asset_options.fix_base_link = True  # Make it static
+        asset_options.disable_gravity = True
+        
+        # Create box asset
+        platform_asset = gym.create_box(
+            sim,
+            self.platform_size[0],  # width
+            self.platform_size[1],  # depth
+            self.platform_size[2],  # height
+            asset_options
+        )
+        
+        # Add platform to each environment
+        for env_idx in range(self.num_envs):
+            env = self.simulator.envs[env_idx]
+            
+            # Set platform pose
+            pose = gymapi.Transform()
+            pose.p = gymapi.Vec3(
+                self.platform_pos[0],
+                self.platform_pos[1], 
+                self.platform_pos[2]
+            )
+            pose.r = gymapi.Quat(0, 0, 0, 1)  # No rotation
+            
+            # Create platform actor
+            platform_handle = gym.create_actor(
+                env,
+                platform_asset,
+                pose,
+                f"platform_{env_idx}",
+                env_idx,  # collision group
+                0  # collision filter (0 = collide with everything)
+            )
+            
+            # Set platform color (optional)
+            gym.set_rigid_body_color(
+                env,
+                platform_handle,
+                0,  # body index
+                gymapi.MESH_VISUAL_AND_COLLISION,
+                gymapi.Vec3(0.5, 0.5, 0.5)  # Gray color
+            )
+    
+    def reset(self, env_ids=None):
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        
+        obs = super().reset(env_ids)
+        root_states = self.simulator.get_root_state(env_ids)
+        self.goal_pos[env_ids, :] = root_states.root_pos.clone()
+        self.goal_pos[env_ids, 0] += 2  # 2m forward
+        self.goal_pos[env_ids, 2] += self.platform_height  # On top of platform
+        
+        return obs
+    
+    def compute_reset(self):
+        bodies_positions = self.simulator.get_bodies_state().rigid_body_pos
+        bodies_contact_buf = self.self_obs_cb.body_contacts.clone()
+        self.reset_buf[:], self.terminate_buf[:] = compute_humanoid_reset(
+            self.reset_buf,
+            self.progress_buf,
+            bodies_contact_buf,
+            self.non_termination_contact_body_ids,
+            bodies_positions,
+            self.config.max_episode_length,
+            self.config.enable_height_termination,
+            self.termination_heights
+            + self.terrain.get_ground_heights(bodies_positions[:, 0]),
+        )
+        body_height = bodies_positions[:, 0, 2]
+        self.terminate_buf[:] = torch.logical_or(
+            self.terminate_buf[:],
+            body_height < 0.45
+        )
+        self.reset_buf[:] = torch.logical_or(
+            self.reset_buf,
+            self.terminate_buf
+        )
+    
+    def compute_observations(self, env_ids=None):
+        super().compute_observations(env_ids)
+        # transform goal to the robot frame
+        root_states = self.simulator.get_root_state(env_ids)
+        goal_pos_robot = rotations.quat_rotate_inverse(
+            root_states.root_rot, (self.goal_pos - root_states.root_pos), w_last=True)
+        
+        # 2 goal x-y coordinate in robot frame
+        obs = goal_pos_robot[:, :2]
+        self.parkour_obs[env_ids] = obs
+    
+    def get_obs(self):
+        obs = super().get_obs()
+        obs.update({"parkour": self.parkour_obs})
+        return obs
+    
+    def compute_reward(self):
+        root_pos = self.simulator.get_root_state().root_pos
+        
+        self.rew_buf[:] = torch.exp(-torch.norm((self.goal_pos - root_pos)[:, :2], dim=-1) / 2.0)
