@@ -10,6 +10,8 @@ from protomotions.utils.scene_lib import SceneLib  # added creates 3D obj | no n
 
 from isaacgym import gymapi
 
+# FIX OBS SIZE TO 2!!!!!
+
 
 class Parkour(BaseEnv):
     def __init__(self, config, device: torch.device, *args, **kwargs):
