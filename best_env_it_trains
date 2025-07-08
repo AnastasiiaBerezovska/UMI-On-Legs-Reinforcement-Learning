@@ -1,0 +1,130 @@
+import torch
+from torch import Tensor
+from isaac_utils import rotations, torch_utils
+
+from protomotions.envs.base_env.env import BaseEnv
+from protomotions.envs.base_env.env_utils.humanoid_utils import (
+    compute_humanoid_reset,
+)
+from protomotions.utils.scene_lib import SceneLib  # added creates 3D obj | no needed
+
+from isaacgym import gymapi
+
+
+class Parkour(BaseEnv):
+    def __init__(self, config, device: torch.device, *args, **kwargs):
+        super().__init__(config=config, device=device, *args, **kwargs)
+
+        # Parkour observation: goal position in robot frame (x, y)
+        self.parkour_obs = torch.zeros(
+            (self.config.num_envs, 2),  # Changed from steering_params.obs_size to 2
+            device=device,
+            dtype=torch.float,
+        )
+
+        # Hard-coded goal position
+        self.goal_pos = torch.zeros((self.num_envs, 3), device=device, dtype=torch.float) # [number of robots] x [3 coordinates: x,y,z] = each robot has it's own goal pos
+
+
+
+    def create_terrain_and_scene_lib(self):
+        # terrain normal
+        super().create_terrain_and_scene_lib() # create ground/terrain | SceneLib funct review
+        
+        # skipping it | it doesn't work
+        pass
+    
+    def create_actors(self):
+        # create humanoid actors
+        super().create_actors()
+                
+        
+        # create box 
+        box_size = 2.0  # 2m x 2m platform
+        box_height = 0.5  # 0.5m tall
+        
+        asset_options = gymapi.AssetOptions()
+        asset_options.fix_base_link = True  # static
+        
+        box_asset = self.gym.create_box(
+            self.simulator.sim, 
+            box_size, box_size, box_height, 
+            asset_options
+        )
+        
+        # box actors in each environment
+        for i in range(self.num_envs):
+            # 1m forward, 0.25m up (center of 0.5m box)
+            box_pose = gymapi.Transform()
+            box_pose.p = gymapi.Vec3(1.0, 0.0, 0.25)
+            box_pose.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
+            
+            box_actor = self.gym.create_actor(
+                self.simulator.envs[i], 
+                box_asset, 
+                box_pose, 
+                f"box_{i}", 
+                i, 
+                0
+            )
+        
+    def reset(self, env_ids=None):
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        
+        obs = super().reset(env_ids)
+        root_states = self.simulator.get_root_state(env_ids)
+        self.goal_pos[env_ids, :] = root_states.root_pos.clone()
+        self.goal_pos[env_ids, 0] += 2
+        self.goal_pos[env_ids, 2] += 0.5 # added = goal is on top of the platform now
+        
+        return obs
+
+    def compute_reset(self):
+        bodies_positions = self.simulator.get_bodies_state().rigid_body_pos # body parts positions
+        bodies_contact_buf = self.self_obs_cb.body_contacts.clone() # what's touching ground
+
+        self.reset_buf[:], self.terminate_buf[:] = compute_humanoid_reset( # if robot should reset (fell over, time up, etc)
+            self.reset_buf,
+            self.progress_buf,
+            bodies_contact_buf,
+            self.non_termination_contact_body_ids,
+            bodies_positions,
+            self.config.max_episode_length,
+            self.config.enable_height_termination,
+            self.termination_heights
+            + self.terrain.get_ground_heights(bodies_positions[:, 0]),
+        )
+
+        body_height = bodies_positions[:, 0, 2] # [:] = all robots, [0] = first body part (pelvis), [2] = z coordinate (height) | self note
+        self.terminate_buf[:] = torch.logical_or(
+            self.terminate_buf[:],
+            body_height < 0.45  # If robot's pelvis is below 0.45m, it fell
+        )
+        self.reset_buf[:] = torch.logical_or(
+            self.reset_buf,
+            self.terminate_buf
+        )
+
+    def compute_observations(self, env_ids=None):
+        super().compute_observations(env_ids) # Parent observations
+
+        # transform goal to the robot frame =  Convert goal from world coordinates to robot's view
+        root_states = self.simulator.get_root_state(env_ids)
+        goal_pos_robot = rotations.quat_rotate_inverse(
+            root_states.root_rot, (self.goal_pos - root_states.root_pos), w_last=True)    # =  Convert goal from world coordinates to robot's view | goal from the robot's perspective
+        
+        # 2 goal x-y coordinate in robot frame
+        obs = goal_pos_robot[:, :2]       # Only take x,y (not height)
+
+        self.parkour_obs[env_ids] = obs
+
+    def get_obs(self):
+        obs = super().get_obs()
+        obs.update({"parkour": self.parkour_obs})
+        return obs
+
+    def compute_reward(self):
+        root_pos = self.simulator.get_root_state().root_pos # Robot positions | just to remember
+        
+        self.rew_buf[:] = torch.exp(-torch.norm((self.goal_pos - root_pos)[:, :2], dim=-1) / 2.0)
