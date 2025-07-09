@@ -1,0 +1,106 @@
+# Env structure
+  _target_: protomotions.envs.parkour.env.Parkour
+  config:
+    steering_params:
+      obs_size: 2
+
+
+
+
+
+# @package _global_
+
+defaults:
+  - /exp/ppo_mlp
+  - /env/parkour
+
+agent:
+  config:
+    task_reward_w: 1.0
+
+    modules:
+      parkour:
+        _target_: protomotions.agents.common.common.Flatten
+        num_in: ${env.config.steering_params.obs_size}
+        num_out: ${.num_in}
+        config:
+          obs_key: parkour
+          normalize_obs: true
+          norm_clamp_value: 5
+
+    model:
+      config:
+        actor:
+          config:
+            mu_model:
+              config:
+                input_models:
+                  parkour: ${agent.config.modules.parkour}
+        critic:
+          config:
+            input_models:
+              parkour: ${agent.config.modules.parkour}
+
+    extra_inputs:
+      parkour: true
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# defaults:
+#   - /exp/ppo_mlp
+#   - /env/parkour
+
+# agent:
+#   config:
+#     task_reward_w: 1.0
+
+#     modules:
+#       steering:  # target velocity and heading direction  ==> 2 navig goals the obs
+#         _target_: protomotions.agents.common.common.Flatten
+#         num_in: ${env.config.steering_params.obs_size}
+#         num_out: ${.num_in}
+#         config:
+#           obs_key: steering   # rewrite this one create class named parkour and then put it here instead of word steering later
+#           normalize_obs: true
+#           norm_clamp_value: 5
+
+#     model:
+#       config:
+#         actor:
+#           config:
+#             mu_model:
+#               config:
+#                 input_models:
+#                   steering: ${agent.config.modules.steering}   #update name from steering in modules and model and critic
+#         critic:
+#           config:
+#             input_models:
+#               steering: ${agent.config.modules.steering}
+
+#     extra_inputs:
+#       steering: true
